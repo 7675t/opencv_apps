@@ -52,7 +52,6 @@
 #include <dynamic_reconfigure/server.h>
 #include "opencv_apps/MatchTemplateConfig.h"
 #include "opencv_apps/RectArrayStamped.h"
-#include <std_msgs/Float64.h>
 
 namespace match_template
 {
@@ -62,8 +61,7 @@ namespace match_template
     image_transport::Publisher matched_img_pub_;
     image_transport::Subscriber img_sub_;
     image_transport::CameraSubscriber cam_sub_;
-    ros::Publisher matched_val_pub_;
-    ros::Publisher matched_rect_pub_;
+    ros::Publisher msg_pub_;
 
     boost::shared_ptr < image_transport::ImageTransport > it_;
 
@@ -74,24 +72,16 @@ namespace match_template
 
     bool debug_view_;
     int match_method_;
-#if (CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2) // mask is only supported since opencv 3.2 (https://github.com/opencv/opencv/pull/3554)
     bool use_mask_;
-#endif
 
       ros::Time prev_stamp_;
 
       cv::Mat templ_;
-#if (CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2)
       cv::Mat mask_;
-#endif
 
     void reconfigureCallback (Config & new_config, uint32_t level)
     {
       config_ = new_config;
-      if ( match_method_ != config_.match_method ) {
-        match_method_ = config_.match_method;
-        NODELET_WARN_STREAM("Change Mathing Method to " << match_method_);
-      }
     }
 
     const std::string & frameWithDefault (const std::string & frame, const std::string & image_frame)
@@ -128,25 +118,32 @@ namespace match_template
         int result_rows = frame.rows - templ_.rows + 1;
         cv::Mat result (result_rows, result_cols, CV_32FC1);
 
+        //-- Show template
+        if (debug_view_)
+        {
+          cv::imshow ("Template", templ_);
+          int c = cv::waitKey (1);
+        }
+
         //! [match_template]
         /// Do the Matching and Normalize
         bool method_accepts_mask = (match_method_ == CV_TM_SQDIFF || match_method_ == CV_TM_CCORR_NORMED);
-#if (CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2)
         if (use_mask_ && method_accepts_mask)
         {
           matchTemplate (frame, templ_, result, match_method_, mask_);
         }
         else
-#endif
         {
           matchTemplate (frame, templ_, result, match_method_);
         }
+        //! [normalize]
+        //normalize (result, result, 0, 255, cv::NORM_MINMAX, CV_8UC1, cv::Mat ());
+        normalize (result, result, 0, 255, cv::NORM_MINMAX, CV_8UC1, cv::Mat ());
 
         //! [best_match]
         /// Localizing the best match with minMaxLoc
         double minVal;
         double maxVal;
-        double matchVal;
         cv::Point minLoc;
         cv::Point maxLoc;
         cv::Point matchLoc;
@@ -157,34 +154,15 @@ namespace match_template
         if (match_method_ == CV_TM_SQDIFF || match_method_ == CV_TM_SQDIFF_NORMED || match_method_ == CV_TM_CCORR)
         {
           matchLoc = minLoc;
-          matchVal = minVal;
         }
         else
         {
           matchLoc = maxLoc;
-          matchVal = maxVal;
         }
-        NODELET_DEBUG_STREAM(std::fixed << std::setw(12) << minVal << " " << maxVal << " min " << matchVal);
-
-        //! [normalize] for visualization
-        normalize (result, result, 0, 255, cv::NORM_MINMAX, CV_8UC1, cv::Mat ());
-
         rectangle (frame, matchLoc, cv::Point (matchLoc.x + templ_.cols, matchLoc.y + templ_.rows), cv::Scalar::all (0),
                    2, 8, 0);
-        std::stringstream ss;
-        ss << std::fixed << std::setw(12) << std::setprecision(0) << matchVal;
-        cv::putText(frame, ss.str(), cv::Point(0,20), cv::FONT_HERSHEY_PLAIN, 1.5, cv::Scalar(255.0, 255.0, 255.0), 1, CV_AA);
-        rectangle (result, cv::Point (matchLoc.x - templ_.cols/2, matchLoc.y - templ_.rows/2), cv::Point (matchLoc.x + templ_.cols/2, matchLoc.y + templ_.rows/2),
+        rectangle (result, matchLoc, cv::Point (matchLoc.x + templ_.cols, matchLoc.y + templ_.rows),
                    cv::Scalar::all (0), 2, 8, 0);
-
-        //-- Show template and result
-        if (debug_view_)
-        {
-          cv::imshow ("Template", templ_);
-          cv::imshow ("Soure Image", frame);
-          cv::imshow ("Result window", result);
-          int c = cv::waitKey (1);
-        }
 
         // Publish the image.
         sensor_msgs::Image::Ptr out_img =
@@ -193,21 +171,6 @@ namespace match_template
           cv_bridge::CvImage (msg->header, sensor_msgs::image_encodings::MONO8, result).toImageMsg ();
         img_pub_.publish (out_img);
         matched_img_pub_.publish (match_img);
-
-        // Publish the result.
-        opencv_apps::RectArrayStamped matched_rect_msg;
-        matched_rect_msg.header = msg->header;
-        opencv_apps::Rect rect_msg;
-        rect_msg.x = matchLoc.x;
-        rect_msg.y = matchLoc.y;
-        rect_msg.width = templ_.cols;
-        rect_msg.height = templ_.rows;
-        matched_rect_msg.rects.push_back(rect_msg);
-        matched_rect_pub_.publish (matched_rect_msg);
-
-        std_msgs::Float64 matched_val_msg;
-        matched_val_msg.data = matchVal;
-        matched_val_pub_.publish (matched_val_msg);
       }
       catch (cv::Exception & e)
       {
@@ -241,15 +204,10 @@ namespace match_template
 
       pnh_->param ("debug_view", debug_view_, false);
       pnh_->param ("match_method", match_method_, (int) CV_TM_SQDIFF);
-#if (CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2)
       pnh_->param ("use_mask", use_mask_, false);
-#endif
-      std::string templ_file;
+      std::string templ_file, mask_file;
       pnh_->param ("template_file", templ_file, std::string ("template.png"));
-#if (CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2)
-      std::string mask_file;
       pnh_->param ("mask_file", mask_file, std::string ("mask.png"));
-#endif
 
       NODELET_INFO ("template_file: %s", templ_file.c_str ());
 
@@ -257,19 +215,23 @@ namespace match_template
       {
         always_subscribe_ = true;
       }
-#if (CV_MAJOR_VERSION >= 3 && CV_MINOR_VERSION >= 2)
       if (use_mask_)
       {
         mask_ = imread (mask_file, cv::IMREAD_COLOR);
       }
-#endif
-      templ_ = imread (templ_file, cv::IMREAD_COLOR);
-      if (!templ_.data)
+      if (templ_file.empty ())
       {
-        NODELET_ERROR ("Cannot open template file (%s)", templ_file.c_str ());
-        exit (-1);
+        NODELET_ERROR ("Cannot open template file %s", templ_file.c_str ());
+        exit (0);
       }
+      //templ_ = imread(templ_file, cv::IMREAD_COLOR);
+      templ_ = imread (templ_file, cv::IMREAD_COLOR);
 
+      if (debug_view_)
+      {
+        cv::imshow ("Match Template", templ_);
+        int c = cv::waitKey (1);
+      }
       prev_stamp_ = ros::Time (0, 0);
 
       reconfigure_server_ = boost::make_shared < dynamic_reconfigure::Server < Config > >(*pnh_);
@@ -279,8 +241,7 @@ namespace match_template
 
       img_pub_ = advertiseImage (*pnh_, "image", 1);
       matched_img_pub_ = advertiseImage (*pnh_, "matched_image", 1);
-      matched_val_pub_ = advertise< std_msgs::Float64 > (*pnh_, "matched_value", 1);
-      matched_rect_pub_ = advertise < opencv_apps::RectArrayStamped > (*pnh_, "matched_rectangle", 1);
+      msg_pub_ = advertise < opencv_apps::RectArrayStamped > (*pnh_, "matched_rectangle", 1);
 
       onInitPostProcess ();
     }
